@@ -1,0 +1,26 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=19
+STOP=90
+
+start_service() {
+    local owner=$(cat /etc/cf_node_name 2>/dev/null)
+    
+    if [ -z "$owner" ]; then
+        logger -t "cf-monitor" "Loi: Khong tim thay file /etc/cf_node_name."
+        return 1
+    fi
+
+    # Thuc the 1: Luong lang nghe UBUS
+    procd_open_instance "ubus_listener"
+    procd_set_param command /usr/bin/monitor.sh "$owner" "ubus"
+    procd_set_param respawn
+    procd_close_instance
+
+    # Thuc the 2: Luong giam sat DDOS
+    procd_open_instance "ddos_scanner"
+    procd_set_param command /usr/bin/monitor.sh "$owner" "ddos"
+    procd_set_param respawn
+    procd_close_instance
+}

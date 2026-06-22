@@ -1,0 +1,78 @@
+#!/bin/sh
+
+echo "Content-type: application/json"
+echo ""
+
+# 1. Lay IP tu URL Webhook
+TARGET_IP=$(echo "$QUERY_STRING" | awk -v RS='&' -F'=' '$1=="ip" {print $2}')
+
+if [ -z "$TARGET_IP" ]; then
+    echo '{"message": "Loi: Thieu tham so ?ip= trong URL!"}'
+    exit 0
+fi
+
+# =================================================================
+# 2. LOAD CAU HINH DONG (DYNAMIC CONFIGURATION)
+# =================================================================
+# Tra nguoc OWNER tu IP
+OWNER=$(uci show cloudflare_ddns | grep "\.ip='$TARGET_IP'" | awk -F'.' '{print $2}')
+
+if [ -z "$OWNER" ]; then
+    echo "{\"message\": \"Loi: IP [$TARGET_IP] khong nam trong Config!\"}"
+    exit 0
+fi
+
+# Load duong dan Script tu Global
+SCRIPT_DELETE=$(uci -q get cloudflare_ddns.settings.SCRIPT_DELETE)
+SCRIPT_UPDATE=$(uci -q get cloudflare_ddns.settings.SCRIPT_UPDATE)
+
+# Load SSH Key cua rieng Node nay
+SSH_KEY=$(uci -q get cloudflare_ddns.${OWNER}.ssh_key)
+
+# Kiem tra tinh toan ven (Sanity Check)
+if [ -z "$SCRIPT_DELETE" ] || [ -z "$SCRIPT_UPDATE" ] || [ -z "$SSH_KEY" ]; then
+    echo "{\"message\": \"Loi Config: Thieu duong dan SCRIPT hoac SSH_KEY cho node [$OWNER]!\"}"
+    exit 0
+fi
+
+# 3. Doc trang thai tu Uptime Kuma
+POST_DATA=$(cat)
+STATUS=$(echo "$POST_DATA" | jq -r '.heartbeat.status // empty')
+
+# =================================================================
+# 4. KICH HOAT LOGIC & CHONG SPAM (ANTI-FLAPPING)
+# =================================================================
+UP_LOCK_FILE="/tmp/kuma_up_${OWNER}.lock"
+LOCAL_OWNER=$(cat /etc/cf_node_name 2>/dev/null) # Lay ten cua HK1
+
+if [ "$STATUS" = "0" ]; then
+    if ping -c 2 -W 2 "8.8.8.8" > /dev/null 2>&1 || ping -c 2 -W 2 "1.1.1.1" > /dev/null 2>&1; then
+        
+        $SCRIPT_DELETE ALL "$OWNER" > /dev/null 2>&1 &
+        
+        echo "{\"message\": \"Xac nhan [$OWNER] DOWN. Da kich hoat CASCADE DELETE (ALL) tren toan he thong!\"}"
+    else
+        echo '{"message": "HK1 mat mang - Bao dong gia!"}'
+    fi
+
+elif [ "$STATUS" = "1" ]; then
+    NOW=$(date +%s)
+    if [ -f "$UP_LOCK_FILE" ]; then
+        LAST_UP=$(cat "$UP_LOCK_FILE")
+        if [ $((NOW - LAST_UP)) -lt 300 ]; then
+            echo "{\"message\": \"Rate Limit: Bo qua tin hieu UP cho [$OWNER] de chong Spam (Flapping)!\"}"
+            exit 0
+        fi
+    fi
+    echo "$NOW" > "$UP_LOCK_FILE"
+
+    # 1. Gọi SSH cho Slave (X96air) tu Update phan cua no
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no root@$TARGET_IP "$SCRIPT_UPDATE --force $OWNER" > /dev/null 2>&1 &
+    
+    # 2. Gọi chinh Master (HK1) tu Update lai phan cua no (vi da bi xoa do hieu ung Cascade)
+    if [ -n "$LOCAL_OWNER" ]; then
+        $SCRIPT_UPDATE --force "$LOCAL_OWNER" > /dev/null 2>&1 &
+    fi
+
+    echo "{\"message\": \"Dang goi SSH phuc hoi cho [$OWNER] va Local [$LOCAL_OWNER]\"}"
+fi
