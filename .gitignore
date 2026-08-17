@@ -1,0 +1,7 @@
+# Ignore actual UCI config containing real API keys and secrets
+cloudflare_ddns
+
+# Lock and temp files
+*.lock
+*.time
+/tmp/
