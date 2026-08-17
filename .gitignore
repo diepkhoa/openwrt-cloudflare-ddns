@@ -1,5 +1,6 @@
 # Ignore actual UCI config containing real API keys and secrets
 cloudflare_ddns
+deploy.ps1
 
 # Lock and temp files
 *.lock
