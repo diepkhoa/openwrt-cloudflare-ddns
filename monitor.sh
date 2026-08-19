@@ -216,9 +216,14 @@ elif [ "$MODE" = "healthcheck" ]; then
                         local best_ip=$(extract_best_ip "$new_all_ips")
                         
                         if echo "$best_ip" | grep -q "\["; then
-                            logger -t "diepkhoa-Monitor" "[$target_node] Phat hien IPv6 moi ($best_ip). Nang cap Endpoint tu IPv4 len IPv6!"
-                            wg_update_endpoint "$target_node" "$best_ip"
-                            echo "$new_all_ips" > "$ep_ip_file"
+                            local raw_ipv6=$(echo "$best_ip" | sed 's/^\[//;s/\].*//')
+                            if ping -c 1 -W 2 "$raw_ipv6" > /dev/null 2>&1 || ping6 -c 1 -W 2 "$raw_ipv6" > /dev/null 2>&1; then
+                                logger -t "diepkhoa-Monitor" "[$target_node] Phat hien IPv6 moi ($best_ip) va ping thanh cong. Nang cap Endpoint tu IPv4 len IPv6!"
+                                wg_update_endpoint "$target_node" "$best_ip"
+                                echo "$new_all_ips" > "$ep_ip_file"
+                            else
+                                logger -t "diepkhoa-Monitor" "[$target_node] Phat hien IPv6 moi ($best_ip) nhung ping that bai. Khong nang cap!"
+                            fi
                         fi
                     fi
                 fi
