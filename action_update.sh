@@ -92,24 +92,54 @@ get_ipv4() {
 get_ipv6() {
     local mac="$1"
     local ip=""
+
     if [ -n "$mac" ]; then
-        # Quet MAC LAN
-        ip=$(ip -6 neigh show | grep -i "$mac" | awk '{print $1}' | grep -E "^[23]" | head -n 1)
+        # =========================================================================
+        # 1. QUÉT IPV6 CỦA THIẾT BỊ LAN THEO MAC
+        # =========================================================================
+        ip=$(ip -6 neigh show 2>/dev/null | grep -i "$mac" | awk '{print $1}' | grep -E "^[23]" | head -n 1)
         if [ -z "$ip" ]; then
             ping -c 1 -W 1 ff02::1%br-lan >/dev/null 2>&1
-            ip=$(ip -6 neigh show | grep -i "$mac" | awk '{print $1}' | grep -E "^[23]" | head -n 1)
+            ip=$(ip -6 neigh show 2>/dev/null | grep -i "$mac" | awk '{print $1}' | grep -E "^[23]" | head -n 1)
         fi
     else
-        # Lay IPv6 cua Router (Uu tien dung route de lay IP Global chuan nhat)
-        ip=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | grep src | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n 1)
-        
-        # Fallback sang Ubus neu route chua cap nhat kip
+        # =========================================================================
+        # 2. LẤY IPV6 PUBLIC CỦA CHÍNH CỔNG WAN ROUTER
+        # =========================================================================
+
+        # BƯỚC 1: Xác định chính xác tên card mạng L3 của cổng WAN (tránh xa wg*, warp*)
+        local wan_dev=""
+        for iface in "$WAN_IFACE" "${WAN_IFACE}6" "${WAN_IFACE}_6" "wan6" "wan"; do
+            [ -z "$iface" ] && continue
+            wan_dev=$(ubus call network.interface."$iface" status 2>/dev/null | jq -r '.l3_device // .device // empty' 2>/dev/null)
+            [ -n "$wan_dev" ] && [ "$wan_dev" != "null" ] && break
+        done
+
+        # Fallback nếu ubus chưa load: Lấy device có Default Gateway IPv4 (bỏ qua VPN)
+        if [ -z "$wan_dev" ] || [ "$wan_dev" = "null" ]; then
+            wan_dev=$(ip -4 route show default 2>/dev/null | grep -v -E "wg|warp|tun|br-" | awk '{print $5}' | head -n 1)
+        fi
+
+        # BƯỚC 2: Đọc trực tiếp từ Kernel trên card mạng WAN đó (Lấy IP Public SLAAC/GUA chuẩn nhất)
+        if [ -n "$wan_dev" ]; then
+            ip=$(ip -6 addr show dev "$wan_dev" scope global 2>/dev/null | grep -E "inet6 [23]" | grep -v "deprecated" | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
+        fi
+
+        # BƯỚC 3: Nếu vẫn chưa có, thử đọc từ UBUS của WAN
         if [ -z "$ip" ]; then
-            ip=$(ubus call network.interface.wan6 status 2>/dev/null | jq -r '.["ipv6-address"][0].address // empty')
-            [ -z "$ip" ] && ip=$(ubus call network.interface.${WAN_IFACE}6 status 2>/dev/null | jq -r '.["ipv6-address"][0].address // empty')
-            [ -z "$ip" ] && ip=$(ubus call network.interface.${WAN_IFACE}_6 status 2>/dev/null | jq -r '.["ipv6-address"][0].address // empty')
+            for iface in "$WAN_IFACE" "wan6" "wan"; do
+                [ -z "$iface" ] && continue
+                ip=$(ubus call network.interface."$iface" status 2>/dev/null | jq -r '.["ipv6-address"][]?.address // empty' 2>/dev/null | grep -E "^[23]" | head -n 1)
+                [ -n "$ip" ] && break
+            done
+        fi
+
+        # BƯỚC 4: Fallback cuối cùng nếu đi qua NAT: Gọi ra ngoài nhưng BIND CHẶT qua card WAN
+        if [ -z "$ip" ] && [ -n "$wan_dev" ]; then
+            ip=$(curl -6 -s --interface "$wan_dev" --max-time 3 https://api64.ipify.org 2>/dev/null | grep -E "^[23]")
         fi
     fi
+
     echo "$ip"
 }
 

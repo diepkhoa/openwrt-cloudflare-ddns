@@ -298,8 +298,6 @@ elif [ "$MODE" = "healthcheck" ]; then
                         # Luu lai danh sach IP moi
                         echo "$new_all_ips" > "$ep_ip_file"
                         if [ "$current_state" = "down" ]; then echo "recovering" > "$state_file"; fi
-                    else
-                        logger -t "diepkhoa-Monitor" "[$target_node] IP Endpoint tren DNS chua thay doi. Tiep tuc cho..."
                     fi
                 fi
             fi
