@@ -15,7 +15,8 @@ config_load "$CONFIG_FILE"
 config_get ENABLED settings enabled "0"
 if [ "$ENABLED" != "1" ]; then exit 0; fi
 
-config_get WAN_IFACE "$MY_OWNER" wan_iface "wan"
+config_get WAN_IFACE_V4 "$MY_OWNER" wan_iface_v4 "wan"
+config_get WAN_IFACE_V6 "$MY_OWNER" wan_iface_v6 ""
 config_get MAX_CONNECTIONS "$MY_OWNER" ddos_threshold "5000"
 
 config_get SCRIPT_UPDATE settings SCRIPT_UPDATE ""
@@ -44,16 +45,16 @@ send_telegram_message() {
 
 # ==================== LUONG 1: UBUS EVENT ====================
 if [ "$MODE" = "ubus" ]; then
-    logger -t "diepkhoa-Monitor" "Bat dau luong UBUS (Node: $MY_OWNER | Cong: $WAN_IFACE va IPv6 tuong ung)"
+    logger -t "diepkhoa-Monitor" "Bat dau luong UBUS (Node: $MY_OWNER | IPv4: $WAN_IFACE_V4 | IPv6: ${WAN_IFACE_V6:-khong co})"
     
-    ubus listen network.interface | awk -v wan_if="$WAN_IFACE" -v hide_lock="$DDOS_HIDE_LOCK" -v owner="$MY_OWNER" -v script_update="$SCRIPT_UPDATE" '
+    ubus listen network.interface | awk -v wan_v4="$WAN_IFACE_V4" -v wan_v6="$WAN_IFACE_V6" -v hide_lock="$DDOS_HIDE_LOCK" -v owner="$MY_OWNER" -v script_update="$SCRIPT_UPDATE" '
         BEGIN {
-            # Tao bieu thuc Regex de bat ca "wan", "wan6", va "wan_6"
-            # Cu phap (_6|6)? nghia la co the co hoac khong co duoi "6" hoac "_6"
-            if_regex = "\"" wan_if "(_6|6)?\""
+            # Tao regex khop chinh xac tung interface ("wan" hoac "wan6")
+            if_regex = "\"" wan_v4 "\""
+            if (wan_v6 != "") if_regex = if_regex "|\"" wan_v6 "\""
         }
         /ifup|ifupdate/ && $0 ~ if_regex {
-            system("if [ ! -f " hide_lock " ]; then logger -t diepkhoa-Monitor \"Mang UP (Bat duoc su kien tu " wan_if " hoac IPv6) -> Goi Update.\"; \"" script_update "\" --force " owner " > /dev/null 2>&1 & fi")
+            system("if [ ! -f " hide_lock " ]; then logger -t diepkhoa-Monitor \"Mang UP (su kien " wan_v4 "/" wan_v6 ") -> Goi Update.\"; \"" script_update "\" --force " owner " > /dev/null 2>&1 & fi")
             fflush()
         }
     '
@@ -80,9 +81,9 @@ elif [ "$MODE" = "ddos" ]; then
                 rm -f "$STRIKE_TIME_FILE" 
                 touch "$DDOS_HIDE_LOCK"
                 
-                ifdown "$WAN_IFACE"
+                ifdown "$WAN_IFACE_V4"
                 sleep 5
-                ifup "$WAN_IFACE"
+                ifup "$WAN_IFACE_V4"
                 while ! ping -c 1 -W 2 "1.1.1.1" > /dev/null 2>&1; do sleep 2; done
                 
                 logger -t "diepkhoa-Monitor" "Mang da thong, bat dau CASCADE DELETE cho [$MY_OWNER]..."
@@ -97,9 +98,9 @@ elif [ "$MODE" = "ddos" ]; then
                 
                 send_telegram_message "*High Connections ($MY_OWNER)*\nConns: \`$CURRENT_CONNS\`\nAction: Resetting PPPoE."
                 
-                ifdown "$WAN_IFACE"
+                ifdown "$WAN_IFACE_V4"
                 sleep 5
-                ifup "$WAN_IFACE"
+                ifup "$WAN_IFACE_V4"
                 sleep 30
             fi
         fi

@@ -76,15 +76,28 @@ config_get TELEGRAM_BOT_TOKEN settings TELEGRAM_BOT_TOKEN ""
 config_get TELEGRAM_CHAT_ID settings TELEGRAM_CHAT_ID ""
 
 # ==================== HAM LAY IP THONG MINH ====================
-config_get WAN_IFACE "$MY_OWNER" wan_iface "wan"
+config_get WAN_IFACE_V4 "$MY_OWNER" wan_iface_v4 "wan"
+config_get WAN_IFACE_V6 "$MY_OWNER" wan_iface_v6 ""
 
 # Ham lay IPv4 (Chi tra ve IP hoac rong)
 get_ipv4() {
-    local ip=$(ubus call network.interface.$WAN_IFACE status 2>/dev/null | jq -r '.["ipv4-address"][0].address // empty')
+    # Buoc 1: Doc truc tiep tu UBUS cong WAN IPv4
+    local ip=$(ubus call network.interface.$WAN_IFACE_V4 status 2>/dev/null | jq -r '.["ipv4-address"][0].address // empty')
+
+    # Buoc 2: Fallback - lay L3 device tu UBUS roi doc IP tu kernel
     if [ -z "$ip" ]; then
-        local l3_dev=$(ubus call network.interface.$WAN_IFACE status 2>/dev/null | jq -r '.l3_device // empty')
-        [ -n "$l3_dev" ] && ip=$(ip -4 addr show dev "$l3_dev" 2>/dev/null | grep -w "inet" | awk '{print $2}' | cut -d/ -f1 | head -n 1)
+        local l3_dev=$(ubus call network.interface.$WAN_IFACE_V4 status 2>/dev/null | jq -r '.l3_device // empty')
+        [ -n "$l3_dev" ] && [ "$l3_dev" != "null" ] && \
+            ip=$(ip -4 addr show dev "$l3_dev" 2>/dev/null | grep -w "inet" | awk '{print $2}' | cut -d/ -f1 | head -n 1)
     fi
+
+    # Buoc 3: Fallback cuoi - lay interface co default IPv4 route (bo qua VPN/WireGuard)
+    if [ -z "$ip" ]; then
+        local gw_dev=$(ip -4 route show default 2>/dev/null | grep -v -E 'wg[0-9]|warp|tun' | awk '{print $5}' | head -n 1)
+        [ -n "$gw_dev" ] && \
+            ip=$(ip -4 addr show dev "$gw_dev" 2>/dev/null | grep -w "inet" | awk '{print $2}' | cut -d/ -f1 | head -n 1)
+    fi
+
     echo "$ip"
 }
 
@@ -107,9 +120,9 @@ get_ipv6() {
         # 2. LẤY IPV6 PUBLIC CỦA CHÍNH CỔNG WAN ROUTER
         # =========================================================================
 
-        # BƯỚC 1: Xác định chính xác tên card mạng L3 của cổng WAN (tránh xa wg*, warp*)
+        # BƯỚC 1: Xác định chính xác tên card mạng L3 của cổng WAN IPv6 (tránh xa wg*, warp*)
         local wan_dev=""
-        for iface in "$WAN_IFACE" "${WAN_IFACE}6" "${WAN_IFACE}_6" "wan6" "wan"; do
+        for iface in "$WAN_IFACE_V6" "$WAN_IFACE_V4" "wan6" "wan"; do
             [ -z "$iface" ] && continue
             wan_dev=$(ubus call network.interface."$iface" status 2>/dev/null | jq -r '.l3_device // .device // empty' 2>/dev/null)
             [ -n "$wan_dev" ] && [ "$wan_dev" != "null" ] && break
@@ -125,9 +138,9 @@ get_ipv6() {
             ip=$(ip -6 addr show dev "$wan_dev" scope global 2>/dev/null | grep -E "inet6 [23]" | grep -v "deprecated" | awk '{print $2}' | cut -d'/' -f1 | head -n 1)
         fi
 
-        # BƯỚC 3: Nếu vẫn chưa có, thử đọc từ UBUS của WAN
+        # BƯỚC 3: Nếu vẫn chưa có, thử đọc từ UBUS của WAN IPv6
         if [ -z "$ip" ]; then
-            for iface in "$WAN_IFACE" "wan6" "wan"; do
+            for iface in "$WAN_IFACE_V6" "$WAN_IFACE_V4" "wan6" "wan"; do
                 [ -z "$iface" ] && continue
                 ip=$(ubus call network.interface."$iface" status 2>/dev/null | jq -r '.["ipv6-address"][]?.address // empty' 2>/dev/null | grep -E "^[23]" | head -n 1)
                 [ -n "$ip" ] && break
@@ -143,33 +156,52 @@ get_ipv6() {
     echo "$ip"
 }
 
-# ==================== VONG LAP CHO IP (CO GIOI HAN TIMEOUT) ====================
-logger -t "diepkhoa-action" "Dang kiem tra IPv4..."
-GLOBAL_V4_IP=""
-RETRY_V4=0
-# Cho toi da 6 lan x 5s = 30 giay
-while [ -z "$GLOBAL_V4_IP" ] && [ $RETRY_V4 -lt 6 ]; do
-    GLOBAL_V4_IP=$(get_ipv4)
-    if [ -z "$GLOBAL_V4_IP" ]; then
-        sleep 5
-        RETRY_V4=$((RETRY_V4+1))
-    fi
-done
-[ -n "$GLOBAL_V4_IP" ] && logger -t "diepkhoa-action" "Da lay duoc IPv4: $GLOBAL_V4_IP" || logger -t "diepkhoa-action" "Khong co IPv4."
+# ==================== LAY IP SONG SONG (PARALLEL - toi da 30s) ====================
+_V4_TMP=$(mktemp)
+_V6_TMP=$(mktemp)
 
-GLOBAL_V6_IP=""
-if grep -qE "option IPV6 '1'|option IPV6 'true'" /etc/config/$CONFIG_FILE 2>/dev/null; then
-    logger -t "diepkhoa-action" "Dang kiem tra IPv6..."
-    RETRY_V6=0
-    # Cho toi da 6 lan x 5s = 30 giay
-    while [ -z "$GLOBAL_V6_IP" ] && [ $RETRY_V6 -lt 6 ]; do
-        GLOBAL_V6_IP=$(get_ipv6 "")
-        if [ -z "$GLOBAL_V6_IP" ]; then
-            sleep 5
-            RETRY_V6=$((RETRY_V6+1))
-        fi
+# --- Luong IPv4: chay nen ---
+(
+    logger -t "diepkhoa-action" "Dang kiem tra IPv4..."
+    _retry=0
+    while [ $_retry -lt 6 ]; do
+        _ip=$(get_ipv4)
+        if [ -n "$_ip" ]; then echo -n "$_ip" > "$_V4_TMP"; break; fi
+        sleep 5
+        _retry=$((_retry + 1))
     done
-    [ -n "$GLOBAL_V6_IP" ] && logger -t "diepkhoa-action" "Da lay duoc IPv6: $GLOBAL_V6_IP" || logger -t "diepkhoa-action" "Khong co IPv6."
+) &
+_PID_V4=$!
+
+# --- Luong IPv6: chay nen (neu IPV6 duoc bat trong config) ---
+_PID_V6=""
+if grep -qE "option IPV6 '1'|option IPV6 'true'" /etc/config/$CONFIG_FILE 2>/dev/null; then
+    (
+        logger -t "diepkhoa-action" "Dang kiem tra IPv6..."
+        _retry=0
+        while [ $_retry -lt 6 ]; do
+            _ip=$(get_ipv6 "")
+            if [ -n "$_ip" ]; then echo -n "$_ip" > "$_V6_TMP"; break; fi
+            sleep 5
+            _retry=$((_retry + 1))
+        done
+    ) &
+    _PID_V6=$!
+fi
+
+# --- Cho ca 2 luong hoan thanh ---
+wait $_PID_V4
+[ -n "$_PID_V6" ] && wait $_PID_V6
+
+GLOBAL_V4_IP=$(cat "$_V4_TMP" 2>/dev/null)
+GLOBAL_V6_IP=$(cat "$_V6_TMP" 2>/dev/null)
+rm -f "$_V4_TMP" "$_V6_TMP"
+
+[ -n "$GLOBAL_V4_IP" ] && logger -t "diepkhoa-action" "Da lay duoc IPv4: $GLOBAL_V4_IP" \
+    || logger -t "diepkhoa-action" "Khong co IPv4."
+if [ -n "$_PID_V6" ]; then
+    [ -n "$GLOBAL_V6_IP" ] && logger -t "diepkhoa-action" "Da lay duoc IPv6: $GLOBAL_V6_IP" \
+        || logger -t "diepkhoa-action" "Khong co IPv6."
 fi
 
 # Neu ca 2 IP deu rong -> Mang thuc su chua co -> Thoat de nha khoa Flock
