@@ -75,6 +75,20 @@ sync_to_node() {
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=5 \
         root@"${NODE_IP}" "
+            # 0. Kiem tra va cai dat phu thuoc
+            for pkg in curl jq; do
+                if ! command -v \$pkg >/dev/null 2>&1; then
+                    echo '  [INFO] Cai dat goi bi thieu: \$pkg tren [$section]...'
+                    if command -v apk >/dev/null 2>&1; then
+                        apk update >/dev/null 2>&1
+                        apk add \$pkg >/dev/null 2>&1
+                    else
+                        opkg update >/dev/null 2>&1
+                        opkg install \$pkg >/dev/null 2>&1
+                    fi
+                fi
+            done && \
+
             # 1. Bung nén toàn bộ file vào root /
             tar -xzf - -C / && \
             
@@ -102,6 +116,20 @@ config_foreach sync_to_node node
 # ==================== KÍCH HOẠT CHO CHÍNH MASTER ====================
 echo "-----------------------------------------------------"
 echo "Dang thiet lap dich vu cho chinh Master: [$MY_OWNER]..."
+
+# 0. Kiem tra va cai dat phu thuoc cho Master
+for pkg in curl jq; do
+    if ! command -v $pkg >/dev/null 2>&1; then
+        echo "  [INFO] Cai dat goi bi thieu: $pkg tren Master..."
+        if command -v apk >/dev/null 2>&1; then
+            apk update >/dev/null 2>&1
+            apk add $pkg >/dev/null 2>&1
+        else
+            opkg update >/dev/null 2>&1
+            opkg install $pkg >/dev/null 2>&1
+        fi
+    fi
+done
 
 chmod +x $CHMOD_FILES 2>/dev/null
 echo "$MY_OWNER" > /etc/cf_node_name

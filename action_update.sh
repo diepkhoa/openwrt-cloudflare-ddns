@@ -114,6 +114,10 @@ get_ipv4() {
             
             if [ -n "$ext_ip" ]; then
                 ip="$ext_ip"
+            else
+                # [BUG FIX]: Neu la Private IP ma khong the lay duoc IP Public (do mang chua san sang), 
+                # phai set ip ve rong de vong lap ben ngoai biet ma cho 5 giay roi get_ipv4 lai.
+                ip=""
             fi
         fi
     fi
