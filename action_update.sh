@@ -81,21 +81,41 @@ config_get WAN_IFACE_V6 "$MY_OWNER" wan_iface_v6 ""
 
 # Ham lay IPv4 (Chi tra ve IP hoac rong)
 get_ipv4() {
-    # Buoc 1: Doc truc tiep tu UBUS cong WAN IPv4
-    local ip=$(ubus call network.interface.$WAN_IFACE_V4 status 2>/dev/null | jq -r '.["ipv4-address"][0].address // empty')
-
-    # Buoc 2: Fallback - lay L3 device tu UBUS roi doc IP tu kernel
-    if [ -z "$ip" ]; then
-        local l3_dev=$(ubus call network.interface.$WAN_IFACE_V4 status 2>/dev/null | jq -r '.l3_device // empty')
-        [ -n "$l3_dev" ] && [ "$l3_dev" != "null" ] && \
-            ip=$(ip -4 addr show dev "$l3_dev" 2>/dev/null | grep -w "inet" | awk '{print $2}' | cut -d/ -f1 | head -n 1)
+    local ip=""
+    
+    # Buoc 1: [Toi uu toc do] Su dung thu vien chuan cua OpenWRT, khong dung jq (Thoi gian xu ly < 5ms)
+    if [ -f /lib/functions/network.sh ]; then
+        . /lib/functions/network.sh
+        network_get_ipaddr ip "$WAN_IFACE_V4" 2>/dev/null
     fi
 
-    # Buoc 3: Fallback cuoi - lay interface co default IPv4 route (bo qua VPN/WireGuard)
+    # Buoc 2: Fallback doc truc tiep tu ubus nhanh bang grep
+    if [ -z "$ip" ]; then
+        ip=$(ubus call network.interface."$WAN_IFACE_V4" status 2>/dev/null | grep -oE '"address": "[0-9\.]+"' | head -n 1 | cut -d'"' -f4)
+    fi
+
+    # Buoc 3: Fallback cuoi - doc truc tiep tu kernel card mang hien tai co default route
     if [ -z "$ip" ]; then
         local gw_dev=$(ip -4 route show default 2>/dev/null | grep -v -E 'wg[0-9]|warp|tun' | awk '{print $5}' | head -n 1)
         [ -n "$gw_dev" ] && \
-            ip=$(ip -4 addr show dev "$gw_dev" 2>/dev/null | grep -w "inet" | awk '{print $2}' | cut -d/ -f1 | head -n 1)
+            ip=$(ip -4 addr show dev "$gw_dev" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
+    fi
+
+    # Buoc 4: [XU LY NAT/CGNAT] Kiem tra xem IP co phai la IP Private hoac CGNAT khong
+    if [ -n "$ip" ]; then
+        # Regex loc: 10.x.x.x, 172.16-31.x.x, 192.168.x.x, 100.64-127.x.x (CGNAT)
+        if echo "$ip" | grep -qE '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.)'; then
+            # Day la Private IP. Goi API Cloudflare Trace ra ngoai de lay IP Public cuc nhanh (< 100ms)
+            local ext_ip=$(curl -4 -s --max-time 3 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | grep -E '^ip=' | cut -d= -f2)
+            # Neu Cloudflare loi thi thu ipify
+            if [ -z "$ext_ip" ]; then
+                ext_ip=$(curl -4 -s --max-time 3 https://api.ipify.org 2>/dev/null | grep -oE '^[0-9\.]+')
+            fi
+            
+            if [ -n "$ext_ip" ]; then
+                ip="$ext_ip"
+            fi
+        fi
     fi
 
     echo "$ip"
@@ -210,23 +230,8 @@ if [ -z "$GLOBAL_V4_IP" ] && [ -z "$GLOBAL_V6_IP" ]; then
     exit 0
 fi
 
-# ==================== KIEM TRA INTERNET (CO GIOI HAN TIMEOUT) ====================
-logger -t "diepkhoa-action" "IP da san sang. Dang kiem tra ket noi Internet..."
-INTERNET_OK=0
-# Chi thu ping toi da 4 lan (~20 giay)
-for i in 1 2 3 4; do
-    if ping -c 1 -W 2 "1.1.1.1" > /dev/null 2>&1; then
-        INTERNET_OK=1
-        break
-    fi
-    sleep 5
-done
-
-if [ "$INTERNET_OK" -eq 0 ]; then
-    logger -t "diepkhoa-action" "Internet chua thong. Thoat script de cho su kien tiep theo."
-    exit 0
-fi
-logger -t "diepkhoa-action" "Internet da thong! Tien hanh update DDNS."
+# ==================== BO QUA KIEM TRA INTERNET (FAIL FAST) ====================
+logger -t "diepkhoa-action" "IP da san sang. Tien hanh update DDNS len Cloudflare ngay lap tuc..."
 
 # ==================== XU LY TUNG BAN GHI CUA OWNER ====================
 # Luu danh sach cascade de xu ly sau cung
