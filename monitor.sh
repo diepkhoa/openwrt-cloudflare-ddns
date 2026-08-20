@@ -47,6 +47,24 @@ send_telegram_message() {
 if [ "$MODE" = "ubus" ]; then
     logger -t "diepkhoa-Monitor" "Bat dau luong UBUS (Node: $MY_OWNER | IPv4: $WAN_IFACE_V4 | IPv6: ${WAN_IFACE_V6:-khong co})"
     
+    cleanup() {
+        # Tim va kill tat ca tien trinh con cua shell nay bang thuoc tinh PPID
+        # (Dung ham thuan shell de thay the pkill cho cac firmware rut gon)
+        for stat in /proc/[0-9]*/stat; do
+            [ -f "$stat" ] || continue
+            read -r line < "$stat"
+            # Lay phan sau ky tu ") " de cat ten tien trinh co the chua khoang trang
+            after_paren="${line#*) }"
+            set -- $after_paren
+            if [ "$2" = "$$" ]; then
+                cpid="${stat#/proc/}"
+                kill "${cpid%/stat}" 2>/dev/null
+            fi
+        done
+        exit 0
+    }
+    trap cleanup TERM INT
+
     ubus listen network.interface | awk -v wan_v4="$WAN_IFACE_V4" -v wan_v6="$WAN_IFACE_V6" -v hide_lock="$DDOS_HIDE_LOCK" -v owner="$MY_OWNER" -v script_update="$SCRIPT_UPDATE" '
         BEGIN {
             # Tao regex khop chinh xac tung interface ("wan" hoac "wan6")
@@ -57,7 +75,10 @@ if [ "$MODE" = "ubus" ]; then
             system("if [ ! -f " hide_lock " ]; then logger -t diepkhoa-Monitor \"Mang UP (su kien " wan_v4 "/" wan_v6 ") -> Goi Update.\"; \"" script_update "\" --force " owner " > /dev/null 2>&1 & fi")
             fflush()
         }
-    '
+    ' &
+
+    # Cho tien trinh ngam hoan thanh (truong hop nay la vo han, cho den khi co tin hieu TERM tu procd)
+    wait
 
 # ==================== LUONG 2: QUET DDOS ====================
 elif [ "$MODE" = "ddos" ]; then
