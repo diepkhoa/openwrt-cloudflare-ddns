@@ -150,16 +150,16 @@ elif [ "$MODE" = "healthcheck" ]; then
         ' | sort | tr '\n' ' ' | awk '{$1=$1; print $0}'
     }
 
-    # trich xuat IP ngon nhat (Uu tien IPv6) tu danh sach tren
+    # trich xuat IP ngon nhat (Uu tien IPv4 truoc de khoi tao ket noi, nang cap IPv6 sau thong qua hot-upgrade)
     extract_best_ip() {
         local all_ips="$1"
         local v6=$(echo "$all_ips" | tr ' ' '\n' | grep ":" | head -n 1)
         local v4=$(echo "$all_ips" | tr ' ' '\n' | grep "\." | head -n 1)
         
-        if [ -n "$v6" ]; then
-            echo "[$v6]"
-        elif [ -n "$v4" ]; then
+        if [ -n "$v4" ]; then
             echo "$v4"
+        elif [ -n "$v6" ]; then
+            echo "[$v6]"
         fi
     }
 
@@ -235,16 +235,26 @@ elif [ "$MODE" = "healthcheck" ]; then
                     if [ $((now - last_dns_check)) -ge 60 ]; then
                         echo "$now" > "$dns_time_file"
                         local new_all_ips=$(resolve_endpoint_ips "$wg_endpoint")
-                        local best_ip=$(extract_best_ip "$new_all_ips")
+                        local v6_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep ":" | head -n 1)
                         
-                        if echo "$best_ip" | grep -q "\["; then
-                            local raw_ipv6=$(echo "$best_ip" | sed 's/^\[//;s/\].*//')
-                            if ping -c 1 -W 2 "$raw_ipv6" > /dev/null 2>&1 || ping6 -c 1 -W 2 "$raw_ipv6" > /dev/null 2>&1; then
-                                logger -t "diepkhoa-Monitor" "[$target_node] Phat hien IPv6 moi ($best_ip) va ping thanh cong. Nang cap Endpoint tu IPv4 len IPv6!"
-                                wg_update_endpoint "$target_node" "$best_ip"
+                        if [ -n "$v6_ip" ]; then
+                            local best_ip="[$v6_ip]"
+                            logger -t "diepkhoa-Monitor" "[$target_node] Phat hien IPv6 ($best_ip), tien hanh Inline Tunnel Test..."
+                            
+                            # Lay IP (hoac [IPv6]) hien tai de rollback neu test that bai
+                            local current_ep_ip_only=$(echo "$current_ep" | sed 's/:[0-9]*$//')
+                            
+                            # Thu nap IPv6
+                            wg_update_endpoint "$target_node" "$best_ip"
+                            sleep 3 # Doi handshake
+                            
+                            # Ping vao tunnel IP thay vi WAN IP
+                            if ping -c 1 -W 2 "$target_ip" > /dev/null 2>&1; then
+                                logger -t "diepkhoa-Monitor" "[$target_node] Inline Tunnel Test IPv6 THANH CONG! Giu nguyen IPv6."
                                 echo "$new_all_ips" > "$ep_ip_file"
                             else
-                                logger -t "diepkhoa-Monitor" "[$target_node] Phat hien IPv6 moi ($best_ip) nhung ping that bai. Khong nang cap!"
+                                logger -t "diepkhoa-Monitor" "[$target_node] Inline Tunnel Test IPv6 THAT BAI (Mat ket noi). Rollback ve IPv4."
+                                wg_update_endpoint "$target_node" "$current_ep_ip_only"
                             fi
                         fi
                     fi
@@ -274,12 +284,22 @@ elif [ "$MODE" = "healthcheck" ]; then
                 local old_all_ips=""
                 if [ -f "$ep_ip_file" ]; then old_all_ips=$(cat "$ep_ip_file"); fi
                 
-                # SO SANH TOAN BO DANH SACH IP
+                local best_ip=$(extract_best_ip "$new_all_ips")
+                local current_ep=$(wg show all endpoints | awk -v pk="$wg_pubkey" '$2 == pk {print $3}')
+                
+                local force_update=0
+                # SO SANH TOAN BO DANH SACH IP HOAC KIEM TRA FALLBACK
                 if [ -n "$new_all_ips" ] && [ "$new_all_ips" != "$old_all_ips" ]; then
+                    force_update=1
                     logger -t "diepkhoa-Monitor" "[$target_node] IP Endpoint thay doi ($old_all_ips -> $new_all_ips). Re-resolve WG."
-                    
-                    # Trich xuat IP tot nhat de nap vao WG
-                    local best_ip=$(extract_best_ip "$new_all_ips")
+                elif [ -n "$current_ep" ] && [ -n "$best_ip" ] && [ "$current_ep" != "(none)" ]; then
+                    case "$current_ep" in
+                        "${best_ip}:"*) ;;
+                        *) force_update=1; logger -t "diepkhoa-Monitor" "[$target_node] Sai lech Endpoint (hien tai: $current_ep, mong muon: $best_ip). Fallback WG." ;;
+                    esac
+                fi
+                
+                if [ "$force_update" -eq 1 ]; then
                     wg_update_endpoint "$target_node" "$best_ip"
                     
                     echo "$new_all_ips" > "$ep_ip_file"
@@ -309,12 +329,22 @@ elif [ "$MODE" = "healthcheck" ]; then
                     local old_all_ips=""
                     if [ -f "$ep_ip_file" ]; then old_all_ips=$(cat "$ep_ip_file"); fi
                     
-                    # So sanh toan bo danh sach IP
+                    local best_ip=$(extract_best_ip "$new_all_ips")
+                    local current_ep=$(wg show all endpoints | awk -v pk="$wg_pubkey" '$2 == pk {print $3}')
+                    
+                    local force_update=0
+                    # So sanh toan bo danh sach IP hoac kiem tra fallback
                     if [ -n "$new_all_ips" ] && [ "$new_all_ips" != "$old_all_ips" ]; then
+                        force_update=1
                         logger -t "diepkhoa-Monitor" "[$target_node] IP Endpoint thay doi khi dang chờ ($old_all_ips -> $new_all_ips). Re-resolve WG."
-                        
-                        # Trich xuat IP tot nhat (Uu tien IPv6) de nap vao WG
-                        local best_ip=$(extract_best_ip "$new_all_ips")
+                    elif [ -n "$current_ep" ] && [ -n "$best_ip" ] && [ "$current_ep" != "(none)" ]; then
+                        case "$current_ep" in
+                            "${best_ip}:"*) ;;
+                            *) force_update=1; logger -t "diepkhoa-Monitor" "[$target_node] Sai lech Endpoint (hien tai: $current_ep, mong muon: $best_ip) khi dang cho. Fallback WG." ;;
+                        esac
+                    fi
+                    
+                    if [ "$force_update" -eq 1 ]; then
                         wg_update_endpoint "$target_node" "$best_ip"
                         
                         # Luu lai danh sach IP moi
