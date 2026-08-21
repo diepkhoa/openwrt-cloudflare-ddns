@@ -138,7 +138,9 @@ elif [ "$MODE" = "healthcheck" ]; then
             echo "$ep"
             return 0
         fi
-        nslookup "$ep" 2>/dev/null | awk '
+        
+        # [FIX]: Them 1.1.1.1 vao cuoi de ep hoi thang Cloudflare, bo qua DNS Cache cua Router
+        nslookup "$ep" 1.1.1.1 2>/dev/null | awk '
             /^Name:/ {seen=1}
             /^Address/ && seen {
                 for (i=2; i<=NF; i++) {
@@ -158,13 +160,29 @@ elif [ "$MODE" = "healthcheck" ]; then
         config_get wg_pubkey "$target_node" wg_pubkey ""
         config_get wg_port "$target_node" wg_port ""
         
+        # Xoa ky tu an \r tu Windows de chong loi cu pha ngam
+        wg_pubkey=$(echo "$wg_pubkey" | tr -d '\r\n' | xargs)
+        wg_port=$(echo "$wg_port" | tr -d '\r\n' | xargs)
+        
         if [ -z "$wg_pubkey" ] || [ -z "$wg_port" ] || [ -z "$new_ip" ]; then return 1; fi
         
         local iface=$(wg show all dump | awk -v pk="$wg_pubkey" '$2 == pk {print $1; exit}')
         
         if [ -n "$iface" ]; then
-            logger -t "diepkhoa-Monitor" "[$target_node] wg set $iface peer ... endpoint $new_ip:$wg_port"
-            wg set "$iface" peer "$wg_pubkey" endpoint "${new_ip}:${wg_port}"
+            logger -t "diepkhoa-Monitor" "[$target_node] Thuc thi: wg set $iface peer ${wg_pubkey:0:5}... endpoint ${new_ip}:${wg_port}"
+            
+            # [FIX - TUYỆT CHIÊU DOUBLE SET]: 
+            # 1. Nạp 1 IP rác để ép Kernel WireGuard xóa sạch State/Ghost Packet của IP cũ
+            /usr/bin/wg set "$iface" peer "$wg_pubkey" endpoint "127.0.0.1:11111" 2>/dev/null
+            sleep 0.2
+            
+            # 2. Nạp IP mới thật sự vào (Lúc này Kernel đã sạch, IP mới sẽ dính chặt 100%)
+            local wg_err
+            wg_err=$(/usr/bin/wg set "$iface" peer "$wg_pubkey" endpoint "${new_ip}:${wg_port}" 2>&1)
+            
+            if [ $? -ne 0 ]; then
+                logger -t "diepkhoa-Monitor" "[$target_node] LOI WG SET: $wg_err"
+            fi
         fi
     }
 
@@ -192,9 +210,9 @@ elif [ "$MODE" = "healthcheck" ]; then
         [ -f "$dns_time_file" ] && last_dns_check=$(cat "$dns_time_file")
         
         # ====================================================================
-        # KỊCH BẢN 1: MẠNG ĐANG UP (PING TUNNEL THÀNH CÔNG)
+        # KỊCH BẢN 1: MẠNG ĐANG UP (Gửi 3 gói ping, rớt cả 3 mới tính là DOWN)
         # ====================================================================
-        if ping -c 1 -W 2 "$target_ip" > /dev/null 2>&1; then
+        if ping -c 3 -W 3 "$target_ip" > /dev/null 2>&1; then
             if [ "$current_state" != "ok" ]; then
                 logger -t "diepkhoa-Monitor" "[$target_node] Mang WireGuard da phuc hoi. Danh dau OK."
                 echo "ok" > "$state_file"
@@ -212,7 +230,6 @@ elif [ "$MODE" = "healthcheck" ]; then
             if [ -n "$wg_endpoint" ] && [ -n "$wg_pubkey" ]; then
                 local current_ep=$(wg show all endpoints | awk -v pk="$wg_pubkey" '$2 == pk {print $3}')
                 
-                # Nếu đang ở IPv4 (không có dấu ngoặc vuông '[')
                 if [ -n "$current_ep" ] && [ "$current_ep" != "(none)" ] && ! echo "$current_ep" | grep -q "\["; then
                     if [ $((now - last_dns_check)) -ge 60 ]; then
                         echo "$now" > "$dns_time_file"
@@ -222,11 +239,11 @@ elif [ "$MODE" = "healthcheck" ]; then
                         if [ -n "$v6_ip" ]; then
                             #logger -t "diepkhoa-Monitor" "[$target_node] Phat hien IPv6 ($v6_ip). Dang Ping check truoc khi Upgrade..."
                             
-                            # Ping thẳng vào IP Public IPv6 của đối tác
-                            if ping -6 -c 1 -W 2 "$v6_ip" > /dev/null 2>&1 || ping6 -c 1 -W 2 "$v6_ip" > /dev/null 2>&1; then
-                                logger -t "diepkhoa-Monitor" "[$target_node] Ping IPv6 THANH CONG! Tien hanh Upgrade Endpoint."
+                            # Ping check IPv6 (Gửi 2 gói cho chắc chắn)
+                            if ping -6 -c 2 -W 2 "$v6_ip" > /dev/null 2>&1 || ping6 -c 2 -W 2 "$v6_ip" > /dev/null 2>&1; then
+                                logger -t "diepkhoa-Monitor" "[$target_node] Tien hanh Upgrade Endpoint sang ipv6."
                                 wg_update_endpoint "$target_node" "[$v6_ip]"
-                                echo "$new_all_ips" > "$ep_ip_file"
+                                echo "$new_all_ips" > "$ep_ip_file"                        
                             fi
                         fi
                     fi
@@ -239,20 +256,27 @@ elif [ "$MODE" = "healthcheck" ]; then
         # KỊCH BẢN 2: MẠNG ĐANG DOWN (PING TUNNEL THẤT BẠI)
         # ====================================================================
         
-        # Kiem tra Internet ban than truoc khi phan xet
-        if ! ping -c 1 -W 2 "8.8.8.8" > /dev/null 2>&1; then
+        # Kiem tra Internet ban than (Gửi 3 gói)
+        if ! ping -c 3 -W 3 "8.8.8.8" > /dev/null 2>&1; then
             return 0
         fi
         
+        # BỘ LỌC TRỄ (DEBOUNCE): Phải rớt 3 chu kỳ liên tiếp mới Switch
         if [ "$current_state" = "ok" ]; then
-            logger -t "diepkhoa-Monitor" "[$target_node] Rot mang lan 1. Chuyen sang SUSPECT."
-            echo "suspect" > "$state_file"
+            logger -t "diepkhoa-Monitor" "[$target_node] Rot mang lan 1. Chuyen sang SUSPECT_1."
+            echo "suspect_1" > "$state_file"
+            return 0
+        fi
+
+        if [ "$current_state" = "suspect_1" ]; then
+            logger -t "diepkhoa-Monitor" "[$target_node] Rot mang lan 2. Chuyen sang SUSPECT_2."
+            echo "suspect_2" > "$state_file"
             return 0
         fi
         
-        # Xử lý khi ở trạng thái SUSPECT, DOWN, RECOVERING
+        # Xử lý khi ở trạng thái SUSPECT_2, DOWN, RECOVERING
         if [ -n "$wg_endpoint" ]; then
-            if [ $((now - last_dns_check)) -ge 60 ] || [ "$current_state" = "suspect" ]; then
+            if [ $((now - last_dns_check)) -ge 60 ] || [ "$current_state" = "suspect_2" ]; then
                 echo "$now" > "$dns_time_file"
                 
                 local new_all_ips=$(resolve_endpoint_ips "$wg_endpoint")
@@ -261,25 +285,37 @@ elif [ "$MODE" = "healthcheck" ]; then
                 
                 local v6_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep ":" | head -n 1)
                 local v4_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep "\." | head -n 1)
-                local current_ep=$(wg show all endpoints | awk -v pk="$wg_pubkey" '$2 == pk {print $3}')
+                
+                local last_try_file="/tmp/cf_hc_last_try_${target_node}"
+                local last_try="v6"
+                [ -f "$last_try_file" ] && last_try=$(cat "$last_try_file")
                 
                 local next_ip=""
-                if echo "$current_ep" | grep -q "\["; then
-                    # Đang kẹt ở IPv6 -> Toggle về IPv4
-                    [ -n "$v4_ip" ] && next_ip="$v4_ip"
-                else
-                    # Đang kẹt ở IPv4 -> Toggle lên IPv6
-                    [ -n "$v6_ip" ] && next_ip="[$v6_ip]"
-                fi
-                
                 local force_update=0
+                
                 if [ -n "$new_all_ips" ] && [ "$new_all_ips" != "$old_all_ips" ]; then
                     force_update=1
                     logger -t "diepkhoa-Monitor" "[$target_node] IP thay doi tren DNS. Cap nhat Endpoint."
-                    [ -n "$v4_ip" ] && next_ip="$v4_ip" || next_ip="[$v6_ip]"
-                elif [ -n "$next_ip" ] && [ -n "$current_ep" ] && [ "$current_ep" != "(none)" ]; then
+                    
+                    if [ -n "$v4_ip" ]; then
+                        next_ip="$v4_ip"
+                        echo "v4" > "$last_try_file"
+                    else
+                        next_ip="[$v6_ip]"
+                        echo "v6" > "$last_try_file"
+                    fi
+                else
                     force_update=1
-                    #logger -t "diepkhoa-Monitor" "[$target_node] Van mat ket noi. Thu Switch/Toggle sang Endpoint: $next_ip"
+                    if [ "$last_try" = "v6" ] && [ -n "$v4_ip" ]; then
+                        next_ip="$v4_ip"
+                        echo "v4" > "$last_try_file"
+                    elif [ "$last_try" = "v4" ] && [ -n "$v6_ip" ]; then
+                        next_ip="[$v6_ip]"
+                        echo "v6" > "$last_try_file"
+                    else
+                        [ -n "$v4_ip" ] && next_ip="$v4_ip" || next_ip="[$v6_ip]"
+                    fi
+                    logger -t "diepkhoa-Monitor" "[$target_node] Van mat ket noi. Thu Switch sang Endpoint: $next_ip"
                 fi
                 
                 if [ "$force_update" -eq 1 ] && [ -n "$next_ip" ]; then
