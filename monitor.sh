@@ -178,9 +178,6 @@ elif [ "$MODE" = "healthcheck" ]; then
         local iface=$(wg show all dump | awk -v pk="$wg_pubkey" '$2 == pk {print $1; exit}')
         
         if [ -n "$iface" ]; then
-            #logger -t "diepkhoa-Monitor" "[$target_node] Thuc thi: wg set $iface peer ${wg_pubkey:0:5}... endpoint ${new_ip}:${wg_port}"
-            
-            # [FIX - TUYỆT CHIÊU DOUBLE SET]: 
             # Nạp IP mới thật sự vào (Lúc này Kernel đã sạch, IP mới sẽ dính chặt 100%)
             local wg_err=""
             local wg_rc=0
@@ -208,7 +205,6 @@ elif [ "$MODE" = "healthcheck" ]; then
         
         if [ -z "$pubkey" ] || [ -z "$port" ] || [ -z "$new_ip" ]; then return 1; fi
         
-        # [FIX - TUYỆT CHIÊU DOUBLE SET]: 
         # Nạp IP mới thật sự vào (Lúc này Kernel đã sạch, IP mới sẽ dính chặt 100%)
         local wg_err=""
         local wg_rc=0
