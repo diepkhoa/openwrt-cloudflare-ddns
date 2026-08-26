@@ -169,7 +169,7 @@ elif [ "$MODE" = "healthcheck" ]; then
         local iface=$(wg show all dump | awk -v pk="$wg_pubkey" '$2 == pk {print $1; exit}')
         
         if [ -n "$iface" ]; then
-            logger -t "diepkhoa-Monitor" "[$target_node] Thuc thi: wg set $iface peer ${wg_pubkey:0:5}... endpoint ${new_ip}:${wg_port}"
+            #logger -t "diepkhoa-Monitor" "[$target_node] Thuc thi: wg set $iface peer ${wg_pubkey:0:5}... endpoint ${new_ip}:${wg_port}"
             
             # [FIX - TUYỆT CHIÊU DOUBLE SET]: 
             # 1. Nạp 1 IP rác để ép Kernel WireGuard xóa sạch State/Ghost Packet của IP cũ
@@ -315,7 +315,7 @@ elif [ "$MODE" = "healthcheck" ]; then
                     else
                         [ -n "$v4_ip" ] && next_ip="$v4_ip" || next_ip="[$v6_ip]"
                     fi
-                    logger -t "diepkhoa-Monitor" "[$target_node] Van mat ket noi. Thu Switch sang Endpoint: $next_ip"
+                    #logger -t "diepkhoa-Monitor" "[$target_node] Van mat ket noi. Thu Switch sang Endpoint: $next_ip"
                 fi
                 
                 if [ "$force_update" -eq 1 ] && [ -n "$next_ip" ]; then
