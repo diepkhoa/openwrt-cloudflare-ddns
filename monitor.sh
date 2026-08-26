@@ -152,6 +152,14 @@ elif [ "$MODE" = "healthcheck" ]; then
         ' | sort | tr '\n' ' ' | awk '{$1=$1; print $0}'
     }
 
+    # Resolve endpoint roi tach thanh v4/v6, luu vao bien global _resolve_*
+    resolve_endpoint_ver() {
+        local all_ips; all_ips=$(resolve_endpoint_ips "$1")
+        _resolve_all="$all_ips"
+        _resolve_v4=$(echo "$all_ips" | tr ' ' '\n' | grep '\.' | head -n 1)
+        _resolve_v6=$(echo "$all_ips" | tr ' ' '\n' | grep ':' | head -n 1)
+    }
+
     # Helpers for explicit healthcheck list
     _check_hc_item() { [ "$1" = "$2" ] && _hc_match_found=1; }
 
@@ -161,77 +169,65 @@ elif [ "$MODE" = "healthcheck" ]; then
         [ -n "$_hc_match_found" ]
     }
 
-    wg_update_endpoint() {
+    # Doc thong tin WireGuard peer cua node tu config, luu vao bien global _wg_*
+    wg_load_peer() {
+        local target_node="$1"
+        config_get _wg_pubkey "$target_node" wg_pubkey ""
+        config_get _wg_port "$target_node" wg_port ""
+        config_get _wg_endpoint "$target_node" wg_endpoint ""
+        config_get _wg_payload_iface "$target_node" payload_iface ""
+        # Xoa ky tu an \r tu Windows de chong loi cu pha ngam
+        _wg_pubkey=$(echo "$_wg_pubkey" | tr -d '\r\n' | xargs)
+        _wg_port=$(echo "$_wg_port" | tr -d '\r\n' | xargs)
+    }
+
+    # Tim interface chua peer co pubkey tuong ung
+    wg_find_iface() {
+        local pubkey="$1"
+        # Dump co "all" dinh dang: <iface> <pubkey> <preshared> <endpoint> ... nen lay cot 2
+        wg show all dump 2>/dev/null | awk -v pk="$pubkey" '$2 == pk {print $1; exit}'
+    }
+
+    wg_set_endpoint() {
         local target_node="$1"
         local new_ip="$2"
-        
-        local wg_pubkey wg_port
-        config_get wg_pubkey "$target_node" wg_pubkey ""
-        config_get wg_port "$target_node" wg_port ""
-        
-        # Xoa ky tu an \r tu Windows de chong loi cu pha ngam
-        wg_pubkey=$(echo "$wg_pubkey" | tr -d '\r\n' | xargs)
-        wg_port=$(echo "$wg_port" | tr -d '\r\n' | xargs)
-        
-        if [ -z "$wg_pubkey" ] || [ -z "$wg_port" ] || [ -z "$new_ip" ]; then return 1; fi
-        
-        local iface=$(wg show all dump | awk -v pk="$wg_pubkey" '$2 == pk {print $1; exit}')
-        
+        local iface_override="$3"
+
+        wg_load_peer "$target_node"
+
+        if [ -z "$_wg_pubkey" ] || [ -z "$_wg_port" ] || [ -z "$new_ip" ]; then return 1; fi
+
+        local iface="$iface_override"
+        [ -z "$iface" ] && iface=$(wg_find_iface "$_wg_pubkey")
+
         if [ -n "$iface" ]; then
             # Nạp IP mới thật sự vào (Lúc này Kernel đã sạch, IP mới sẽ dính chặt 100%)
             local wg_err=""
             local wg_rc=0
-            for i in $(seq 1 3); do
-                wg_err=$(/usr/bin/wg set "$iface" peer "$wg_pubkey" endpoint "${new_ip}:${wg_port}" 2>&1)
+            for i in $(seq 1 10); do
+                wg_err=$(/usr/bin/wg set "$iface" peer "$_wg_pubkey" endpoint "${new_ip}:${_wg_port}" 2>&1)
                 wg_rc=$?
                 if [ $wg_rc -eq 0 ]; then
                     break
                 fi
-                sleep 1
+                sleep 0.5
             done
-            
+
             if [ $wg_rc -ne 0 ]; then
                 logger -t "diepkhoa-Monitor" "[$target_node] LOI WG SET: $wg_err"
             fi
         fi
     }
 
-    wg_update_tunnel_endpoint() {
-        local iface="$1" pubkey="$2" new_ip="$3" port="$4"
-        
-        # Xoa ky tu an \r tu Windows de chong loi cu pha ngam
-        pubkey=$(echo "$pubkey" | tr -d '\r\n' | xargs)
-        port=$(echo "$port" | tr -d '\r\n' | xargs)
-        
-        if [ -z "$pubkey" ] || [ -z "$port" ] || [ -z "$new_ip" ]; then return 1; fi
-        
-        # Nạp IP mới thật sự vào (Lúc này Kernel đã sạch, IP mới sẽ dính chặt 100%)
-        local wg_err=""
-        local wg_rc=0
-        for i in $(seq 1 3); do
-            wg_err=$(/usr/bin/wg set "$iface" peer "$pubkey" endpoint "${new_ip}:${port}" 2>&1)
-            wg_rc=$?
-            if [ $wg_rc -eq 0 ]; then
-                break
-            fi
-            sleep 1
-        done
-        
-        if [ $wg_rc -ne 0 ]; then
-            logger -t "diepkhoa-Monitor" "[$iface] LOI WG SET: $wg_err"
-        fi
-    }
-
     check_tunnel_node() {
         local target_node="$1"
-        
-        local payload_iface payload_ping_ip wg_endpoint wg_pubkey wg_port
-        config_get payload_iface "$target_node" payload_iface ""
+
+        wg_load_peer "$target_node"
+        local payload_iface="$_wg_payload_iface"
+        local wg_endpoint="$_wg_endpoint"
+        local payload_ping_ip
         config_get payload_ping_ip "$target_node" payload_ping_ip ""
-        config_get wg_endpoint "$target_node" wg_endpoint ""
-        config_get wg_pubkey "$target_node" wg_pubkey ""
-        config_get wg_port "$target_node" wg_port ""
-        
+
         if [ -z "$payload_iface" ] || [ -z "$payload_ping_ip" ]; then return 0; fi
         
         # Guard: Kiem tra xem interface co ton tai tren router nay khong
@@ -270,32 +266,28 @@ elif [ "$MODE" = "healthcheck" ]; then
         if [ $((now - last_try_time)) -ge 60 ]; then
             echo "$now" > "$last_try_file"
             
-            # DNS switch / flip v4/v6 logic
-            local new_all_ips=$(resolve_endpoint_ips "$wg_endpoint")
-            local v6_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep ":" | head -n 1)
-            local v4_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep "\." | head -n 1)
-            
+            resolve_endpoint_ver "$wg_endpoint"
+            local new_all_ips="$_resolve_all" v6_ip="$_resolve_v6" v4_ip="$_resolve_v4"
+
             local ip_ver_file="/tmp/cf_hc_last_ip_ver_${target_node}"
-            local last_ver="v6"
+            local last_ver="v4"
             [ -f "$ip_ver_file" ] && last_ver=$(cat "$ip_ver_file")
-            
+
             local next_ip=""
-            if [ "$last_ver" = "v6" ] && [ -n "$v4_ip" ]; then
+            if [ "$last_ver" = "v4" ] && [ -n "$v6_ip" ]; then
+                next_ip="$v6_ip"
+                echo "v6" > "$ip_ver_file"
+            elif [ "$last_ver" = "v6" ] && [ -n "$v4_ip" ]; then
                 next_ip="$v4_ip"
                 echo "v4" > "$ip_ver_file"
-            elif [ "$last_ver" = "v4" ] && [ -n "$v6_ip" ]; then
-                next_ip="[$v6_ip]"
-                echo "v6" > "$ip_ver_file"
             else
-                [ -n "$v4_ip" ] && next_ip="$v4_ip" || next_ip="[$v6_ip]"
+                [ -n "$v6_ip" ] && next_ip="$v6_ip" || next_ip="$v4_ip"
             fi
-            
+
             if [ -n "$next_ip" ]; then
                 logger -t "diepkhoa-Monitor" "[$target_node] Thu recover wg_payload voi endpoint $next_ip..."
-                # Handle IPv6 brackets
-                echo "$next_ip" | grep -q ":" && next_ip="[$next_ip]"
-                # Pre-set endpoint truoc khi ifup
-                wg_update_tunnel_endpoint "$payload_iface" "$wg_pubkey" "$next_ip" "$wg_port"
+                echo "$next_ip" | grep -q ":" || next_ip="[$next_ip]"
+                wg_set_endpoint "$target_node" "$next_ip" "$payload_iface"
                 
                 ifup "$payload_iface"
                 sleep 3
@@ -317,30 +309,29 @@ elif [ "$MODE" = "healthcheck" ]; then
         if [ "$node_type" != "tunnel" ]; then return 0; fi
         
         if node_has_healthcheck "$target_node" "$_RECOVERING_NODE"; then
-            local payload_iface wg_endpoint wg_pubkey wg_port
-            config_get payload_iface "$target_node" payload_iface ""
-            config_get wg_endpoint "$target_node" wg_endpoint ""
-            config_get wg_pubkey "$target_node" wg_pubkey ""
-            config_get wg_port "$target_node" wg_port ""
-            
+            wg_load_peer "$target_node"
+            local payload_iface="$_wg_payload_iface"
+            local wg_endpoint="$_wg_endpoint"
+
             if [ -n "$payload_iface" ] && ip link show "$payload_iface" > /dev/null 2>&1; then
                 logger -t "diepkhoa-Monitor" "[$target_node] Gateway $_RECOVERING_NODE recover -> Wake up tunnel."
-                
+
                 local ep_ip_file="/tmp/cf_hc_ep_ip_${target_node}"
                 local next_ip=""
-                [ -f "$ep_ip_file" ] && next_ip=$(cat "$ep_ip_file" | tr ' ' '\n' | grep "\." | head -n 1) # Fallback to v4 cached ip for fast wake up
-                
+                # Fallback to v6 cached ip for fast wake up
+                [ -f "$ep_ip_file" ] && next_ip=$(cat "$ep_ip_file" | tr ' ' '\n' | grep ":" | head -n 1)
+
                 if [ -z "$next_ip" ]; then
-                    local new_all_ips=$(resolve_endpoint_ips "$wg_endpoint")
-                    next_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep "\." | head -n 1)
-                    [ -z "$next_ip" ] && next_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep ":" | head -n 1)
-                    [ -n "$next_ip" ] && echo "$new_all_ips" > "$ep_ip_file"
+                    resolve_endpoint_ver "$wg_endpoint"
+                    local new_all_ips="$_resolve_all"
+                    next_ip="$_resolve_v6"
+                    [ -z "$next_ip" ] && next_ip="$_resolve_v4"
+                    [ -n "$new_all_ips" ] && echo "$new_all_ips" > "$ep_ip_file"
                 fi
-                
+
                 if [ -n "$next_ip" ]; then
-                    # Handle IPv6 brackets
-                    echo "$next_ip" | grep -q ":" && next_ip="[$next_ip]"
-                    wg_update_tunnel_endpoint "$payload_iface" "$wg_pubkey" "$next_ip" "$wg_port"
+                    echo "$next_ip" | grep -q ":" || next_ip="[$next_ip]"
+                    wg_set_endpoint "$target_node" "$next_ip" "$payload_iface"
                 fi
                 
                 ifup "$payload_iface"
@@ -375,11 +366,10 @@ elif [ "$MODE" = "healthcheck" ]; then
             return 0
         fi
         
-        local target_ip wg_endpoint ssh_key wg_pubkey
+        local target_ip wg_endpoint ssh_key
         config_get target_ip "$target_node" ip ""
         config_get wg_endpoint "$target_node" wg_endpoint ""
         config_get ssh_key "$MY_OWNER" ssh_key ""
-        config_get wg_pubkey "$target_node" wg_pubkey ""
         
         if [ -z "$target_ip" ]; then return 0; fi
         
@@ -414,30 +404,6 @@ elif [ "$MODE" = "healthcheck" ]; then
                     ) &
                 fi
             fi
-            
-            # --- LOGIC UPGRADE LÊN IPV6 (CHỈ KHI ĐANG Ở IPV4) ---
-            if [ -n "$wg_endpoint" ] && [ -n "$wg_pubkey" ]; then
-                local current_ep=$(wg show all endpoints | awk -v pk="$wg_pubkey" '$2 == pk {print $3}')
-                
-                if [ -n "$current_ep" ] && [ "$current_ep" != "(none)" ] && ! echo "$current_ep" | grep -q "\["; then
-                    if [ $((now - last_dns_check)) -ge 60 ]; then
-                        echo "$now" > "$dns_time_file"
-                        local new_all_ips=$(resolve_endpoint_ips "$wg_endpoint")
-                        local v6_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep ":" | head -n 1)
-                        
-                        if [ -n "$v6_ip" ]; then
-                            #logger -t "diepkhoa-Monitor" "[$target_node] Phat hien IPv6 ($v6_ip). Dang Ping check truoc khi Upgrade..."
-                            
-                            # Ping check IPv6 (Gửi 2 gói cho chắc chắn)
-                            if ping -6 -c 2 -W 2 "$v6_ip" > /dev/null 2>&1 || ping6 -c 2 -W 2 "$v6_ip" > /dev/null 2>&1; then
-                                logger -t "diepkhoa-Monitor" "[$target_node] Tien hanh Upgrade Endpoint sang ipv6."
-                                wg_update_endpoint "$target_node" "[$v6_ip]"
-                                echo "$new_all_ips" > "$ep_ip_file"                        
-                            fi
-                        fi
-                    fi
-                fi
-            fi
             return 0
         fi
         
@@ -468,15 +434,16 @@ elif [ "$MODE" = "healthcheck" ]; then
             if [ $((now - last_dns_check)) -ge 60 ] || [ "$current_state" = "suspect_2" ]; then
                 echo "$now" > "$dns_time_file"
                 
-                local new_all_ips=$(resolve_endpoint_ips "$wg_endpoint")
+                resolve_endpoint_ver "$wg_endpoint"
+                local new_all_ips="$_resolve_all"
                 local old_all_ips=""
                 [ -f "$ep_ip_file" ] && old_all_ips=$(cat "$ep_ip_file")
-                
-                local v6_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep ":" | head -n 1)
-                local v4_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep "\." | head -n 1)
+
+                local v6_ip="$_resolve_v6"
+                local v4_ip="$_resolve_v4"
                 
                 local last_try_file="/tmp/cf_hc_last_try_${target_node}"
-                local last_try="v6"
+                local last_try="v4"
                 [ -f "$last_try_file" ] && last_try=$(cat "$last_try_file")
                 
                 local next_ip=""
@@ -485,30 +452,30 @@ elif [ "$MODE" = "healthcheck" ]; then
                 if [ -n "$new_all_ips" ] && [ "$new_all_ips" != "$old_all_ips" ]; then
                     force_update=1
                     logger -t "diepkhoa-Monitor" "[$target_node] IP thay doi tren DNS. Cap nhat Endpoint."
-                    
-                    if [ -n "$v4_ip" ]; then
-                        next_ip="$v4_ip"
-                        echo "v4" > "$last_try_file"
-                    else
+
+                    if [ -n "$v6_ip" ]; then
                         next_ip="[$v6_ip]"
                         echo "v6" > "$last_try_file"
+                    else
+                        next_ip="$v4_ip"
+                        echo "v4" > "$last_try_file"
                     fi
                 else
                     force_update=1
-                    if [ "$last_try" = "v6" ] && [ -n "$v4_ip" ]; then
-                        next_ip="$v4_ip"
-                        echo "v4" > "$last_try_file"
-                    elif [ "$last_try" = "v4" ] && [ -n "$v6_ip" ]; then
+                    if [ "$last_try" = "v4" ] && [ -n "$v6_ip" ]; then
                         next_ip="[$v6_ip]"
                         echo "v6" > "$last_try_file"
+                    elif [ "$last_try" = "v6" ] && [ -n "$v4_ip" ]; then
+                        next_ip="$v4_ip"
+                        echo "v4" > "$last_try_file"
                     else
-                        [ -n "$v4_ip" ] && next_ip="$v4_ip" || next_ip="[$v6_ip]"
+                        [ -n "$v6_ip" ] && next_ip="[$v6_ip]" || next_ip="$v4_ip"
                     fi
-                    #logger -t "diepkhoa-Monitor" "[$target_node] Van mat ket noi. Thu Switch sang Endpoint: $next_ip"
+                    logger -t "diepkhoa-Monitor" "[$target_node] Van mat ket noi (last_try: $last_try). Switch sang: $next_ip"
                 fi
-                
+
                 if [ "$force_update" -eq 1 ] && [ -n "$next_ip" ]; then
-                    wg_update_endpoint "$target_node" "$next_ip"
+                    wg_set_endpoint "$target_node" "$next_ip"
                     echo "$new_all_ips" > "$ep_ip_file"
                     [ "$current_state" != "recovering" ] && echo "recovering" > "$state_file"
                 else
@@ -527,11 +494,70 @@ elif [ "$MODE" = "healthcheck" ]; then
         fi
     }
     
+    check_ipv6_upgrade() {
+        local target_node="$1"
+        if [ "$target_node" = "$MY_OWNER" ]; then return 0; fi
+
+        local node_type
+        config_get node_type "$target_node" node_type "gateway"
+
+        wg_load_peer "$target_node"
+        local wg_endpoint="$_wg_endpoint" wg_pubkey="$_wg_pubkey"
+
+        if [ -z "$wg_endpoint" ] || [ -z "$wg_pubkey" ]; then return 0; fi
+        
+        local current_ep=""
+        local is_tunnel=0
+        local payload_iface=""
+
+        if [ "$node_type" = "tunnel" ]; then
+            payload_iface="$_wg_payload_iface"
+            if [ -n "$payload_iface" ] && ip link show "$payload_iface" > /dev/null 2>&1; then
+                # 'wg show <iface> endpoints' chi co 2 cot: <pubkey> <endpoint> (khong co cot iface)
+                current_ep=$(wg show "$payload_iface" endpoints 2>/dev/null | awk -v pk="$wg_pubkey" '$1 == pk {print $2; exit}')
+                is_tunnel=1
+            fi
+        else
+            # Dump co dinh dang: <iface> <pubkey> <preshared> <endpoint> ... nen endpoint nam o cot 4
+            current_ep=$(wg show all dump 2>/dev/null | awk -v pk="$wg_pubkey" '$2 == pk {print $4; exit}')
+        fi
+        
+        # Nếu không có peer hoặc đã ở IPv6 -> bỏ qua
+        if [ -z "$current_ep" ] || [ "$current_ep" = "(none)" ] || echo "$current_ep" | grep -q "\["; then
+            return 0
+        fi
+        
+        local now=$(date +%s)
+        local dns_time_file="/tmp/cf_hc_v6check_${target_node}"
+        local last_v6_check=0
+        [ -f "$dns_time_file" ] && last_v6_check=$(cat "$dns_time_file")
+        
+        if [ $((now - last_v6_check)) -ge 60 ]; then
+            echo "$now" > "$dns_time_file"
+            resolve_endpoint_ver "$wg_endpoint"
+            local new_all_ips="$_resolve_all"
+            local v6_ip="$_resolve_v6"
+
+            if [ -n "$v6_ip" ]; then
+                if ping -6 -c 2 -W 2 "$v6_ip" > /dev/null 2>&1 || ping6 -c 2 -W 2 "$v6_ip" > /dev/null 2>&1; then
+                    logger -t "diepkhoa-Monitor" "[$target_node] Phat hien IPv6 san sang ($v6_ip). Upgrade tu $current_ep."
+                    if [ "$is_tunnel" -eq 1 ]; then
+                        wg_set_endpoint "$target_node" "[$v6_ip]" "$payload_iface"
+                    else
+                        wg_set_endpoint "$target_node" "[$v6_ip]"
+                    fi
+                    echo "$new_all_ips" > "/tmp/cf_hc_ep_ip_${target_node}"
+                fi
+            fi
+        fi
+    }
+
     _mark_hc() { _hc_explicit=1; }
 
     while true; do
         config_load "$CONFIG_FILE"
         
+        # 1. Healthcheck & Failover (Chỉ chạy cho các node được chỉ định)
         _hc_explicit=""
         config_list_foreach "$MY_OWNER" healthcheck _mark_hc
         
@@ -540,6 +566,9 @@ elif [ "$MODE" = "healthcheck" ]; then
         else
             config_foreach check_node node
         fi
+        
+        # 2. Tự động kiểm tra và nâng cấp lên IPv6 cho TẤT CẢ các peer WireGuard trên router này
+        config_foreach check_ipv6_upgrade node
         
         sleep 15
     done

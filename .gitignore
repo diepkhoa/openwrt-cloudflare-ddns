@@ -6,3 +6,4 @@ deploy.ps1
 *.lock
 *.time
 /tmp/
+*.exe
