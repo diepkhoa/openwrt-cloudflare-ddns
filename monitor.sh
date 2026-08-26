@@ -152,6 +152,15 @@ elif [ "$MODE" = "healthcheck" ]; then
         ' | sort | tr '\n' ' ' | awk '{$1=$1; print $0}'
     }
 
+    # Helpers for explicit healthcheck list
+    _check_hc_item() { [ "$1" = "$2" ] && _hc_match_found=1; }
+
+    node_has_healthcheck() {
+        _hc_match_found=""
+        config_list_foreach "$1" healthcheck _check_hc_item "$2"
+        [ -n "$_hc_match_found" ]
+    }
+
     wg_update_endpoint() {
         local target_node="$1"
         local new_ip="$2"
@@ -172,16 +181,190 @@ elif [ "$MODE" = "healthcheck" ]; then
             #logger -t "diepkhoa-Monitor" "[$target_node] Thuc thi: wg set $iface peer ${wg_pubkey:0:5}... endpoint ${new_ip}:${wg_port}"
             
             # [FIX - TUYỆT CHIÊU DOUBLE SET]: 
-            # 1. Nạp 1 IP rác để ép Kernel WireGuard xóa sạch State/Ghost Packet của IP cũ
-            /usr/bin/wg set "$iface" peer "$wg_pubkey" endpoint "127.0.0.1:11111" 2>/dev/null
-            sleep 0.2
+            # Nạp IP mới thật sự vào (Lúc này Kernel đã sạch, IP mới sẽ dính chặt 100%)
+            local wg_err=""
+            local wg_rc=0
+            for i in $(seq 1 3); do
+                wg_err=$(/usr/bin/wg set "$iface" peer "$wg_pubkey" endpoint "${new_ip}:${wg_port}" 2>&1)
+                wg_rc=$?
+                if [ $wg_rc -eq 0 ]; then
+                    break
+                fi
+                sleep 1
+            done
             
-            # 2. Nạp IP mới thật sự vào (Lúc này Kernel đã sạch, IP mới sẽ dính chặt 100%)
-            local wg_err
-            wg_err=$(/usr/bin/wg set "$iface" peer "$wg_pubkey" endpoint "${new_ip}:${wg_port}" 2>&1)
-            
-            if [ $? -ne 0 ]; then
+            if [ $wg_rc -ne 0 ]; then
                 logger -t "diepkhoa-Monitor" "[$target_node] LOI WG SET: $wg_err"
+            fi
+        fi
+    }
+
+    wg_update_tunnel_endpoint() {
+        local iface="$1" pubkey="$2" new_ip="$3" port="$4"
+        
+        # Xoa ky tu an \r tu Windows de chong loi cu pha ngam
+        pubkey=$(echo "$pubkey" | tr -d '\r\n' | xargs)
+        port=$(echo "$port" | tr -d '\r\n' | xargs)
+        
+        if [ -z "$pubkey" ] || [ -z "$port" ] || [ -z "$new_ip" ]; then return 1; fi
+        
+        # [FIX - TUYỆT CHIÊU DOUBLE SET]: 
+        # Nạp IP mới thật sự vào (Lúc này Kernel đã sạch, IP mới sẽ dính chặt 100%)
+        local wg_err=""
+        local wg_rc=0
+        for i in $(seq 1 3); do
+            wg_err=$(/usr/bin/wg set "$iface" peer "$pubkey" endpoint "${new_ip}:${port}" 2>&1)
+            wg_rc=$?
+            if [ $wg_rc -eq 0 ]; then
+                break
+            fi
+            sleep 1
+        done
+        
+        if [ $wg_rc -ne 0 ]; then
+            logger -t "diepkhoa-Monitor" "[$iface] LOI WG SET: $wg_err"
+        fi
+    }
+
+    check_tunnel_node() {
+        local target_node="$1"
+        
+        local payload_iface payload_ping_ip wg_endpoint wg_pubkey wg_port
+        config_get payload_iface "$target_node" payload_iface ""
+        config_get payload_ping_ip "$target_node" payload_ping_ip ""
+        config_get wg_endpoint "$target_node" wg_endpoint ""
+        config_get wg_pubkey "$target_node" wg_pubkey ""
+        config_get wg_port "$target_node" wg_port ""
+        
+        if [ -z "$payload_iface" ] || [ -z "$payload_ping_ip" ]; then return 0; fi
+        
+        # Guard: Kiem tra xem interface co ton tai tren router nay khong
+        if ! ip link show "$payload_iface" > /dev/null 2>&1; then return 0; fi
+        
+        local state_file="/tmp/cf_hc_state_${target_node}"
+        local current_state="ok"
+        [ -f "$state_file" ] && current_state=$(cat "$state_file")
+        
+        local now=$(date +%s)
+        
+        # === STATE OK ===
+        if [ "$current_state" = "ok" ]; then
+            if ping -c 2 -W 2 -I "$payload_iface" "$payload_ping_ip" > /dev/null 2>&1; then
+                # Ping OK -> O lai OK
+                return 0
+            else
+                # Kiem tra Internet ban than de tranh down nham khi mat mang
+                if ! ping -c 3 -W 3 "8.8.8.8" > /dev/null 2>&1; then
+                    return 0
+                fi
+                
+                logger -t "diepkhoa-Monitor" "[$target_node] Ping wg_payload fail. Ifdown ngay de tranh blackhole."
+                ifdown "$payload_iface"
+                echo "down" > "$state_file"
+                return 0
+            fi
+        fi
+        
+        # === STATE DOWN ===
+        # Rate-limit 60s cho viec thu recover
+        local last_try_file="/tmp/cf_hc_last_try_time_${target_node}"
+        local last_try_time=0
+        [ -f "$last_try_file" ] && last_try_time=$(cat "$last_try_file")
+        
+        if [ $((now - last_try_time)) -ge 60 ]; then
+            echo "$now" > "$last_try_file"
+            
+            # DNS switch / flip v4/v6 logic
+            local new_all_ips=$(resolve_endpoint_ips "$wg_endpoint")
+            local v6_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep ":" | head -n 1)
+            local v4_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep "\." | head -n 1)
+            
+            local ip_ver_file="/tmp/cf_hc_last_ip_ver_${target_node}"
+            local last_ver="v6"
+            [ -f "$ip_ver_file" ] && last_ver=$(cat "$ip_ver_file")
+            
+            local next_ip=""
+            if [ "$last_ver" = "v6" ] && [ -n "$v4_ip" ]; then
+                next_ip="$v4_ip"
+                echo "v4" > "$ip_ver_file"
+            elif [ "$last_ver" = "v4" ] && [ -n "$v6_ip" ]; then
+                next_ip="[$v6_ip]"
+                echo "v6" > "$ip_ver_file"
+            else
+                [ -n "$v4_ip" ] && next_ip="$v4_ip" || next_ip="[$v6_ip]"
+            fi
+            
+            if [ -n "$next_ip" ]; then
+                logger -t "diepkhoa-Monitor" "[$target_node] Thu recover wg_payload voi endpoint $next_ip..."
+                # Handle IPv6 brackets
+                echo "$next_ip" | grep -q ":" && next_ip="[$next_ip]"
+                # Pre-set endpoint truoc khi ifup
+                wg_update_tunnel_endpoint "$payload_iface" "$wg_pubkey" "$next_ip" "$wg_port"
+                
+                ifup "$payload_iface"
+                sleep 3
+                
+                if ping -c 2 -W 2 -I "$payload_iface" "$payload_ping_ip" > /dev/null 2>&1; then
+                    logger -t "diepkhoa-Monitor" "[$target_node] wg_payload da recover OK."
+                    echo "ok" > "$state_file"
+                else
+                    logger -t "diepkhoa-Monitor" "[$target_node] Recover wg_payload fail. Ifdown lai."
+                    ifdown "$payload_iface"
+                fi
+            fi
+        fi
+    }
+
+    wake_tunnel_if_dependent() {
+        local target_node="$1"
+        config_get node_type "$target_node" node_type "gateway"
+        if [ "$node_type" != "tunnel" ]; then return 0; fi
+        
+        if node_has_healthcheck "$target_node" "$_RECOVERING_NODE"; then
+            local payload_iface wg_endpoint wg_pubkey wg_port
+            config_get payload_iface "$target_node" payload_iface ""
+            config_get wg_endpoint "$target_node" wg_endpoint ""
+            config_get wg_pubkey "$target_node" wg_pubkey ""
+            config_get wg_port "$target_node" wg_port ""
+            
+            if [ -n "$payload_iface" ] && ip link show "$payload_iface" > /dev/null 2>&1; then
+                logger -t "diepkhoa-Monitor" "[$target_node] Gateway $_RECOVERING_NODE recover -> Wake up tunnel."
+                
+                local ep_ip_file="/tmp/cf_hc_ep_ip_${target_node}"
+                local next_ip=""
+                [ -f "$ep_ip_file" ] && next_ip=$(cat "$ep_ip_file" | tr ' ' '\n' | grep "\." | head -n 1) # Fallback to v4 cached ip for fast wake up
+                
+                if [ -z "$next_ip" ]; then
+                    local new_all_ips=$(resolve_endpoint_ips "$wg_endpoint")
+                    next_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep "\." | head -n 1)
+                    [ -z "$next_ip" ] && next_ip=$(echo "$new_all_ips" | tr ' ' '\n' | grep ":" | head -n 1)
+                    [ -n "$next_ip" ] && echo "$new_all_ips" > "$ep_ip_file"
+                fi
+                
+                if [ -n "$next_ip" ]; then
+                    # Handle IPv6 brackets
+                    echo "$next_ip" | grep -q ":" && next_ip="[$next_ip]"
+                    wg_update_tunnel_endpoint "$payload_iface" "$wg_pubkey" "$next_ip" "$wg_port"
+                fi
+                
+                ifup "$payload_iface"
+                echo "ok" > "/tmp/cf_hc_state_${target_node}"
+            fi
+        fi
+    }
+
+    down_tunnel_if_dependent() {
+        local target_node="$1"
+        config_get node_type "$target_node" node_type "gateway"
+        if [ "$node_type" != "tunnel" ]; then return 0; fi
+        
+        if node_has_healthcheck "$target_node" "$_DOWNED_NODE"; then
+            local payload_iface
+            config_get payload_iface "$target_node" payload_iface ""
+            if [ -n "$payload_iface" ] && ip link show "$payload_iface" > /dev/null 2>&1; then
+                logger -t "diepkhoa-Monitor" "[$target_node] Gateway $_DOWNED_NODE down -> Down tunnel theo."
+                ifdown "$payload_iface"
+                echo "down" > "/tmp/cf_hc_state_${target_node}"
             fi
         fi
     }
@@ -189,6 +372,12 @@ elif [ "$MODE" = "healthcheck" ]; then
     check_node() {
         local target_node="$1"
         if [ "$target_node" = "$MY_OWNER" ]; then return 0; fi
+        
+        config_get node_type "$target_node" node_type "gateway"
+        if [ "$node_type" = "tunnel" ]; then
+            check_tunnel_node "$target_node"
+            return 0
+        fi
         
         local target_ip wg_endpoint ssh_key wg_pubkey
         config_get target_ip "$target_node" ip ""
@@ -216,6 +405,10 @@ elif [ "$MODE" = "healthcheck" ]; then
             if [ "$current_state" != "ok" ]; then
                 logger -t "diepkhoa-Monitor" "[$target_node] Mang WireGuard da phuc hoi. Danh dau OK."
                 echo "ok" > "$state_file"
+                
+                # Wake up dependent tunnels
+                _RECOVERING_NODE="$target_node"
+                config_foreach wake_tunnel_if_dependent node
                 
                 if [ -n "$ssh_key" ]; then
                     (
@@ -326,6 +519,11 @@ elif [ "$MODE" = "healthcheck" ]; then
                     if [ "$current_state" != "down" ]; then
                         logger -t "diepkhoa-Monitor" "[$target_node] Node that su DOWN (Khong con IP de thu)."
                         echo "down" > "$state_file"
+                        
+                        # Down dependent tunnels
+                        _DOWNED_NODE="$target_node"
+                        config_foreach down_tunnel_if_dependent node
+                        
                         "$SCRIPT_DELETE" "$target_node" "$MY_OWNER" > /dev/null 2>&1 &
                     fi
                 fi
@@ -333,9 +531,20 @@ elif [ "$MODE" = "healthcheck" ]; then
         fi
     }
     
+    _mark_hc() { _hc_explicit=1; }
+
     while true; do
         config_load "$CONFIG_FILE"
-        config_foreach check_node node
+        
+        _hc_explicit=""
+        config_list_foreach "$MY_OWNER" healthcheck _mark_hc
+        
+        if [ -n "$_hc_explicit" ]; then
+            config_list_foreach "$MY_OWNER" healthcheck check_node
+        else
+            config_foreach check_node node
+        fi
+        
         sleep 15
     done
 fi
